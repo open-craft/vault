@@ -2,13 +2,14 @@ package database
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/hashicorp/vault/builtin/logical/database/dbplugin"
+	"github.com/hashicorp/vault/helper/parseutil"
 	"github.com/hashicorp/vault/helper/strutil"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
-	"github.com/y0ssar1an/q"
 )
 
 func pathListRoles(b *databaseBackend) *framework.Path {
@@ -101,7 +102,6 @@ func (b *databaseBackend) pathRoleExistenceCheck() framework.ExistenceFunc {
 			return false, err
 		}
 
-		// q.Q("role existance check:", role)
 		return role != nil, nil
 	}
 }
@@ -135,7 +135,6 @@ func (b *databaseBackend) pathRoleRead() framework.OperationFunc {
 			"renew_statements":      role.Statements.Renewal,
 			"default_ttl":           role.DefaultTTL.Seconds(),
 			"max_ttl":               role.MaxTTL.Seconds(),
-			"static_account:":       role.StaticAccount,
 		}
 		if len(role.Statements.Creation) == 0 {
 			data["creation_statements"] = []string{}
@@ -148,6 +147,14 @@ func (b *databaseBackend) pathRoleRead() framework.OperationFunc {
 		}
 		if len(role.Statements.Renewal) == 0 {
 			data["renew_statements"] = []string{}
+		}
+
+		if role.StaticAccount != nil {
+			sa := make(map[string]interface{})
+			sa["username"] = role.StaticAccount.Username
+			sa["rotation_frequency"] = role.StaticAccount.RotationFrequency.Nanoseconds()
+
+			data["static_account"] = sa
 		}
 
 		return &logical.Response{
@@ -182,11 +189,6 @@ func (b *databaseBackend) pathRoleCreateUpdate() framework.OperationFunc {
 			role = &roleEntry{}
 		}
 
-		// q.Q("role in RoleCreateUpdate:", role)
-		// q.Q("data in RoleCreateUpdate:", data.Schema)
-
-		static := data.Get("static_account").(map[string]interface{})
-		q.Q("static:", static)
 		// DB Attributes
 		{
 			if dbNameRaw, ok := data.GetOk("db_name"); ok {
@@ -248,6 +250,31 @@ func (b *databaseBackend) pathRoleCreateUpdate() framework.OperationFunc {
 
 		role.Statements.Revocation = strutil.RemoveEmpty(role.Statements.Revocation)
 
+		// Static Account information
+		staticRaw := data.Get("static_account").(map[string]interface{})
+		var sa *staticAccount
+		if len(staticRaw) > 0 {
+			sa = &staticAccount{}
+
+			sa.Username = staticRaw["username"].(string)
+			if sa.Username == "" {
+				return logical.ErrorResponse("username is required for static accounts"), nil
+			}
+
+			rfRaw, ok := staticRaw["rotation_frequency"]
+			if !ok {
+				return logical.ErrorResponse("rotation_frequency is a required field for static accounts"), nil
+			}
+			sa.RotationFrequency, err = parseutil.ParseDurationSecond(rfRaw)
+			if err != nil {
+				return logical.ErrorResponse(fmt.Sprintf("invalid rotation_frequency: %s", err)), nil
+			}
+		}
+
+		if sa != nil {
+			role.StaticAccount = sa
+		}
+
 		// Store it
 		entry, err := logical.StorageEntryJSON("role/"+name, role)
 		if err != nil {
@@ -275,20 +302,10 @@ type staticAccount struct {
 	// Username to create or assume management for static accounts
 	Username string `json:"username"`
 
-	// Password is the current password for static accounts. Return this on
-	// credential request if it exists.
-	//
-	// PreviousPassword is used to preserve the previous password during a rotation. If
-	// any step in the process fails, we have record of the previous password and
-	// can attempt to roll back.
-	//
-	// InitialPassword is used when the Username exists, and Vault needs to assume
-	// management. The InitialPassword needs to be verified before initial
-	// rotation is attempted. After management is assume, this value should be
-	// emptied.
-	Password         string `json:"password"`
-	PreviousPassword string `json:"previous_password"`
-	InitialPassword  string `json:"initial_password"`
+	// Password is the current password for static accounts. As an input, this is
+	// used/required when trying to assume management of an existing static
+	// account. Return this on credential request if it exists.
+	Password string `json:"password"`
 
 	// LastVaultRotation represents the last time Vault rotated the password
 	// PasswordLastSet represents the last time a manual password rotation was
@@ -300,6 +317,11 @@ type staticAccount struct {
 	// "time to live". This value is compared to the LastVaultRotation to
 	// determine if a password needs to be rotated
 	RotationFrequency time.Duration `json:"rotation_frequency"`
+
+	// previousPassword is used to preserve the previous password during a
+	// rotation. If any step in the process fails, we have record of the previous
+	// password and can attempt to roll back.
+	previousPassword string
 }
 
 const pathRoleHelpSyn = `
